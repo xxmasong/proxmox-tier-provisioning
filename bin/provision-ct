@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Create or reconcile one LXC container from its tier ID.
+#
+# Idempotent: running it against an existing container reconciles the settings it
+# manages and leaves everything else alone, so it is safe to re-run after an edit
+# rather than needing a destroy-and-recreate cycle.
+#
+#   provision-ct 410 --role database --memory 4096 --disk 32
+#   provision-ct 400 --role edge --dry-run
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/tiers.sh
+source "${SCRIPT_DIR}/../lib/tiers.sh"
+# shellcheck source=../lib/log.sh
+source "${SCRIPT_DIR}/../lib/log.sh"
+
+: "${TEMPLATE:=local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst}"
+: "${STORAGE:=local-lvm}"
+: "${BRIDGE:=vmbr1}"
+
+usage() {
+    cat <<'EOF'
+Usage: provision-ct <ct-id> [options]
+
+Options:
+  --role <edge|database|app|member>  override the role implied by the ID
+  --hostname <name>                  default: tier<N>-<role>
+  --memory <MB>                      default: by role
+  --cores <n>                        default: by role
+  --disk <GB>                        default: by role
+  --template <volid>                 LXC template
+  --storage <name>                   target storage
+  --start                            start the container when done
+  --dry-run                          print the commands without running them
+  -h, --help                         this message
+EOF
+}
+
+DRY_RUN=0
+START=0
+CT=""
+ROLE=""
+HOSTNAME_OVERRIDE=""
+MEMORY=""
+CORES=""
+DISK=""
+
+while (($#)); do
+    case "$1" in
+        --role)     ROLE="$2"; shift 2 ;;
+        --hostname) HOSTNAME_OVERRIDE="$2"; shift 2 ;;
+        --memory)   MEMORY="$2"; shift 2 ;;
+        --cores)    CORES="$2"; shift 2 ;;
+        --disk)     DISK="$2"; shift 2 ;;
+        --template) TEMPLATE="$2"; shift 2 ;;
+        --storage)  STORAGE="$2"; shift 2 ;;
+        --start)    START=1; shift ;;
+        --dry-run)  DRY_RUN=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        -*)         die "unknown option: $1" ;;
+        *)
+            [[ -n $CT ]] && die "unexpected argument: $1"
+            CT="$1"; shift ;;
+    esac
+done
+
+[[ -n $CT ]] || { usage >&2; exit 2; }
+
+# Validate before anything else. The `||` is required: a bare call inside a
+# command substitution does not trip `set -e`, so a malformed ID would otherwise
+# print its error and provisioning would carry on with an empty address.
+ct_tier "$CT" >/dev/null || die "refusing to provision with an invalid id: ${CT}"
+
+TIER="$(ct_tier "$CT")"
+ROLE="${ROLE:-$(ct_role "$CT")}"
+IP="$(ct_ip "$CT")"
+CIDR="$(ct_cidr "$CT")"
+GATEWAY="$(ct_gateway "$CT")"
+HOSTNAME="${HOSTNAME_OVERRIDE:-tier${TIER}-${ROLE}}"
+
+# Defaults sized by role rather than uniformly: a database needs memory for its
+# shared buffers, an edge is a router and needs almost nothing.
+case "$ROLE" in
+    edge)     MEMORY="${MEMORY:-512}";  CORES="${CORES:-1}"; DISK="${DISK:-8}"  ;;
+    database) MEMORY="${MEMORY:-4096}"; CORES="${CORES:-2}"; DISK="${DISK:-32}" ;;
+    app)      MEMORY="${MEMORY:-2048}"; CORES="${CORES:-2}"; DISK="${DISK:-16}" ;;
+    member)   MEMORY="${MEMORY:-1024}"; CORES="${CORES:-1}"; DISK="${DISK:-8}"  ;;
+    *)        die "unknown role: $ROLE" ;;
+esac
+
+run() {
+    if (( DRY_RUN )); then
+        printf '  would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+ct_exists() {
+    [[ -f "/etc/pve/lxc/${CT}.conf" ]]
+}
+
+log_info "tier ${TIER} ${ROLE}: CT ${CT} at ${IP} via ${GATEWAY}"
+log_info "  hostname=${HOSTNAME} memory=${MEMORY}MB cores=${CORES} disk=${DISK}G"
+
+# An edge routes for its tier; a member must not forward packets at all.
+if [[ $ROLE == edge ]]; then
+    NET="name=eth0,bridge=${BRIDGE},ip=${CIDR}"
+else
+    # A /32 plus an explicit gateway forces every packet through the edge.
+    NET="name=eth0,bridge=${BRIDGE},ip=${CIDR},gw=${GATEWAY}"
+fi
+
+if ct_exists; then
+    log_info "CT ${CT} exists; reconciling"
+    run pct set "$CT" \
+        --hostname "$HOSTNAME" \
+        --memory "$MEMORY" \
+        --cores "$CORES" \
+        --net0 "$NET" \
+        --onboot 1
+else
+    log_info "CT ${CT} does not exist; creating"
+    run pct create "$CT" "$TEMPLATE" \
+        --hostname "$HOSTNAME" \
+        --memory "$MEMORY" \
+        --cores "$CORES" \
+        --rootfs "${STORAGE}:${DISK}" \
+        --net0 "$NET" \
+        --onboot 1 \
+        --unprivileged 1 \
+        --features nesting=1
+fi
+
+if [[ $ROLE == edge ]]; then
+    log_info "enabling forwarding on the edge"
+    run pct exec "$CT" -- sysctl -w net.ipv4.ip_forward=1
+fi
+
+if (( START )); then
+    # Starting a container that is already running is an error, not a no-op.
+    if (( DRY_RUN )) || [[ "$(pct status "$CT" 2>/dev/null)" != "status: running" ]]; then
+        run pct start "$CT"
+    else
+        log_info "CT ${CT} is already running"
+    fi
+fi
+
+log_ok "CT ${CT} provisioned"
