@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Verify a backup by restoring it, not by trusting that the dump exists.
+#
+# A dump you have never test-restored is not a backup. This restores one into a
+# scratch container, runs a caller-supplied check against it, and destroys it
+# again — so "the backup works" is a statement with evidence behind it.
+#
+#   verify-backup /var/lib/vz/dump/vzdump-lxc-410-....tar.zst
+#   verify-backup latest --ct 410 --check 'pg_isready -U postgres'
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/log.sh
+source "${SCRIPT_DIR}/../lib/log.sh"
+
+: "${DUMP_DIR:=/var/lib/vz/dump}"
+: "${SCRATCH_CT:=9999}"
+: "${STORAGE:=local-lvm}"
+
+usage() {
+    cat <<'EOF'
+Usage: verify-backup <archive|latest> [options]
+
+Options:
+  --ct <id>          source container, required when using "latest"
+  --check <command>  run inside the restored container; must exit 0
+  --scratch <id>     scratch container id (default 9999)
+  --keep             do not destroy the scratch container afterwards
+  --dry-run          print the commands without running them
+  -h, --help         this message
+EOF
+}
+
+ARCHIVE=""
+SOURCE_CT=""
+CHECK_CMD=""
+KEEP=0
+DRY_RUN=0
+
+while (($#)); do
+    case "$1" in
+        --ct)      SOURCE_CT="$2"; shift 2 ;;
+        --check)   CHECK_CMD="$2"; shift 2 ;;
+        --scratch) SCRATCH_CT="$2"; shift 2 ;;
+        --keep)    KEEP=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        die "unknown option: $1" ;;
+        *)
+            [[ -n $ARCHIVE ]] && die "unexpected argument: $1"
+            ARCHIVE="$1"; shift ;;
+    esac
+done
+
+[[ -n $ARCHIVE ]] || { usage >&2; exit 2; }
+
+run() {
+    if (( DRY_RUN )); then
+        printf '  would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+if [[ $ARCHIVE == latest ]]; then
+    [[ -n $SOURCE_CT ]] || die '"latest" needs --ct <id>'
+    # Sort by name: vzdump filenames embed a sortable timestamp.
+    ARCHIVE="$(find "$DUMP_DIR" -maxdepth 1 -name "vzdump-lxc-${SOURCE_CT}-*.tar.*" \
+        | sort | tail -n 1)"
+    [[ -n $ARCHIVE ]] || die "no backup found for CT ${SOURCE_CT} in ${DUMP_DIR}"
+    log_info "latest backup for CT ${SOURCE_CT}: $(basename "$ARCHIVE")"
+fi
+
+if (( ! DRY_RUN )) && [[ ! -f $ARCHIVE ]]; then
+    die "archive not found: ${ARCHIVE}"
+fi
+
+if [[ -f "/etc/pve/lxc/${SCRATCH_CT}.conf" ]]; then
+    die "scratch container ${SCRATCH_CT} already exists; pick another --scratch id"
+fi
+
+cleanup() {
+    local status=$?
+    if (( KEEP )); then
+        log_warn "leaving scratch container ${SCRATCH_CT} in place (--keep)"
+        return $status
+    fi
+    # Always tear the scratch container down, including on failure, or a failed
+    # run leaves a half-restored container behind to trip up the next one.
+    if [[ -f "/etc/pve/lxc/${SCRATCH_CT}.conf" ]] || (( DRY_RUN )); then
+        log_info "destroying scratch container ${SCRATCH_CT}"
+        run pct stop "$SCRATCH_CT" 2>/dev/null || true
+        run pct destroy "$SCRATCH_CT" 2>/dev/null || true
+    fi
+    return $status
+}
+trap cleanup EXIT
+
+log_info "restoring $(basename "$ARCHIVE") into scratch CT ${SCRATCH_CT}"
+run pct restore "$SCRATCH_CT" "$ARCHIVE" --storage "$STORAGE" --unprivileged 1
+
+log_info "starting scratch CT ${SCRATCH_CT}"
+run pct start "$SCRATCH_CT"
+
+if (( ! DRY_RUN )); then
+    # Give the container's services a moment before probing them.
+    for _ in $(seq 1 30); do
+        if pct exec "$SCRATCH_CT" -- true 2>/dev/null; then break; fi
+        sleep 1
+    done
+fi
+
+if [[ -n $CHECK_CMD ]]; then
+    log_info "running the check: ${CHECK_CMD}"
+    if (( DRY_RUN )); then
+        printf '  would run: pct exec %s -- sh -c %q\n' "$SCRATCH_CT" "$CHECK_CMD"
+    elif pct exec "$SCRATCH_CT" -- sh -c "$CHECK_CMD"; then
+        log_ok "the check passed"
+    else
+        die "the check failed: this backup does not restore to a working state"
+    fi
+else
+    log_warn "no --check given; only the restore itself was verified"
+fi
+
+log_ok "backup verified: $(basename "$ARCHIVE")"
