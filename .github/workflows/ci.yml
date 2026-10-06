@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -x -S warning bin/provision-ct bin/verify-backup lib/*.sh tests/*.sh
+      - name: tests
+        run: tests/test_tiers.sh
+      - name: the provisioner must reject an invalid id
+        run: "! bin/provision-ct 99 --dry-run"
